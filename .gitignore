@@ -5,3 +5,5 @@ ali_mod/results/*
 ali_mod/out_aae3*/*
 *.pkl
 ali_mod/*
+conditional_FAE/results/*
+conditional_FAE/*.qt
