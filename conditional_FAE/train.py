@@ -18,15 +18,39 @@ from sklearn.metrics.pairwise import pairwise_kernels
 from scipy.spatial.distance import pdist, squareform
 from tqdm import tqdm
 import os
+import pickle
 
 from nets import CVAE
 import flows
 import baseline
 
 from visualize import visualize
+from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 
+parser = ArgumentParser(
+    description=__doc__, formatter_class=ArgumentDefaultsHelpFormatter
+)
+parser.add_argument(
+    "-f",
+    "--fisher",
+    dest="fisher",
+    help="use fisher VAE or not",
+    action='store_true',
+)
+parser.add_argument(
+    "-d",
+    "--device",
+    dest="device",
+    default="cuda:0",
+    help="use fisher VAE or not",
+    required=False
+)
+args = parser.parse_args()
 # set up device 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+if args.device is None:
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+else: 
+    device = torch.device(args.device)
 
 data_path = '/hpc/group/tarokhlab/hy190/MV-SDE/Data/MNIST'
 
@@ -41,10 +65,12 @@ data_name  = 'mnist'
 num_quad   = 1
 early_stop_patience = 20
 retrain_baseline = False
-cFisher = False
+cFisher = args.fisher
+print("Conditional Fisher: ", cFisher)
 
-netsavepath = "/scratch/hy190/CFAE/cFisher_{}_data_{}_numquad_{}/".format(cFisher, data_name,num_quad)
-plotsavepath = "results/cFisher_{}_data_{}_numquad_{}/".format(cFisher, data_name,num_quad)
+savepath = "cFisher_{}_data_{}_numquad_{}".format(cFisher,data_name,num_quad)
+netsavepath = "/scratch/hy190/CFAE/{}".format(savepath)
+plotsavepath = "results/{}/plot/".format(savepath)
 if not os.path.exists(netsavepath):
     os.makedirs(netsavepath)
 if not os.path.exists(plotsavepath):
@@ -179,7 +205,8 @@ scheduler = make_scheduler(scheduler_name, optimizer, milestones=[25, 50, 70, 90
 loader = train_loader
 data_shape = 0 
 best_loss = 100000
-
+valid_loss_list = []
+valid_mse_list = []
 for epoch in tqdm(range(num_epochs+1)):
     loss_epoch = 0
     mse_epoch = 0 
@@ -229,6 +256,8 @@ for epoch in tqdm(range(num_epochs+1)):
           ' | lr : ', optimizer.param_groups[0]['lr'])
     if epoch % 1 == 0:
         local_vae.eval()
+        loss_epoch = 0
+        mse_epoch  = 0
         for iter_, (data, _) in enumerate(valid_loader):
             inputs = data["input"]
             masked_outputs = data["output"]
@@ -245,20 +274,58 @@ for epoch in tqdm(range(num_epochs+1)):
                 inputs = Variable(inputs, requires_grad=True).to(device)
                 masked_outputs = Variable(masked_outputs, requires_grad=True).to(device)
                 
-            output = local_vae.forward(inputs, None)
+            output = local_vae.forward(inputs, masked_outputs)
             loss, mse = local_vae.loss(masked_outputs, output)
+            
             loss_epoch += loss.item()
+            mse_epoch  += mse.item()
             
-            
-        visualize(device=device, pre_trained_baseline=local_vae.baseline, dataloader = valid_loader, 
-                  pre_trained_cvae=local_vae, num_samples=10,num_images=10, data_shape=data_shape, data_name=data_name,
-                  image_path='{}/epoch_{}_gen_samps.png'.format(plotsavepath, epoch))
+        valid_loss_list.append(loss_epoch/len(valid_loader))
+        valid_mse_list.append(mse_epoch/len(valid_loader))
+        if epoch % (int(num_epochs / 5)) == 0:
+            visualize(device=device, pre_trained_baseline=local_vae.baseline, dataloader = valid_loader, 
+                    pre_trained_cvae=local_vae, num_samples=10,num_images=10, data_shape=data_shape, data_name=data_name,
+                    image_path='{}/epoch_{}_gen_samps.png'.format(plotsavepath, epoch))
         
         # save the best model
         if loss_epoch < best_loss:
             best_loss = loss_epoch
-            torch.save(local_vae.state_dict(), '{}/best_epoch_{}_nll_{:.1f}.pt'.format(netsavepath,epoch,best_loss, num_quad))
+            torch.save(local_vae.state_dict(), '{}/best_nll_{:.1f}.pt'.format(netsavepath,epoch,best_loss, num_quad))
 
         # save the model
         torch.save(local_vae.state_dict(), '{}/model_epoch_{}.pt'.format(netsavepath,epoch))
+        
+test_loss = 0
+test_mse = 0
+for iter_, (data, _) in enumerate(valid_loader):
+    inputs = data["input"]
+    masked_outputs = data["output"]
+    data_shape = inputs.shape
+    if len(data_shape) < 4:
+        data_shape = [data_shape[0], 1, data_shape[1], data_shape[2]]
+    # zero grad
+    optimizer.zero_grad()
+    # forward pass
+    if data_name == 'mnist':
+        inputs = Variable(inputs.reshape(inputs.shape[0], 784), requires_grad=True).to(device)
+        masked_outputs = Variable(masked_outputs.reshape(masked_outputs.shape[0], 784), requires_grad=True).to(device)
+    else:
+        inputs = Variable(inputs, requires_grad=True).to(device)
+        masked_outputs = Variable(masked_outputs, requires_grad=True).to(device)
+        
+    output = local_vae.forward(inputs, masked_outputs)
+    loss, mse = local_vae.loss(masked_outputs, output)
+    test_mse += mse.item()
+    test_loss += loss.item()
 
+local_vae.load_state_dict(torch.load('{}/best_nll_{:.1f}.pt'.format(netsavepath,epoch,best_loss, num_quad)))
+
+visualize(device=device, pre_trained_baseline=local_vae.baseline, dataloader = test_loader, 
+          pre_trained_cvae=local_vae, num_samples=10,num_images=10, data_shape=data_shape, data_name=data_name,
+          image_path='results/{}/test_gen_samps.png'.format(savepath, epoch))
+
+all_stats = (valid_loss_list, valid_mse_list, test_loss/len(test_loader), test_mse/len(test_loader))
+
+with open(os.path.join("results/{}".format(savepath),'saved_stats.pkl'), 'wb') as f:
+    pickle.dump(all_stats, f)
+    f.close()

@@ -112,7 +112,7 @@ class CVAE(nn.Module):
         xc[x == self.mask_ind] = y_hat[x == self.mask_ind]
         return xc
     
-    def q_concat(self, x, y=None):
+    def xy_concat(self, x, y=None):
         # During training, takes in full images, as x_cat = (x,y) = x_true
         # During testing/validation this function is not called, y_hat is obtained from baseline
         xc = x.clone()
@@ -158,7 +158,7 @@ class CVAE(nn.Module):
             return y, None, None
         
         # if not testing, need full input for recognition encoder
-        xc_recon = self.q_concat(x,y) # x concat with y_hat
+        xc_recon = self.xy_concat(x,y) # x concat with y_hat
         
         # encode 
         p_mu_z, p_logvar_z = self.prior_encode(xc_prior) # input of the prior encoder
@@ -192,18 +192,19 @@ class CVAE(nn.Module):
             if self.flow:
                 dlnqzy = grad(self.flow.log_probs(recon_z).sum(), xc_recon, create_graph=True)[0]
                 dlnqzz = grad(self.flow.log_probs(recon_z).sum(), recon_z, create_graph=True)[0]
-                dlnpzz = grad(p0.log_prob(recon_z).sum(), recon_z, create_graph=True)[0]
+                #dlnpzz = grad(p0.log_prob(recon_z).sum(), recon_z, create_graph=True)[0]
             else:
                 dlnqzy = grad(q0.log_prob(recon_z).sum(), xc_recon, create_graph=True)[0] # d/dx log q(z|x,y)
                 dlnqzz = grad(q0.log_prob(recon_z).sum(), recon_z, create_graph=True)[0] # d/dz log q(z|x,y)
-                dlnpzz = grad(p0.log_prob(recon_z).sum(), recon_z, create_graph=True)[0] # d/dz log p(z|x,y)
+                #dlnpzz = grad(p0.log_prob(recon_z).sum(), recon_z, create_graph=True)[0] # d/dz log p(z|x,y)
 
-            stability = 0.5* dlnqzy.pow(2).sum() # stability term 
-
-            if detach:
-                fisher_div = 0.5*(dlnqzz - dlnpzz).pow(2).sum() # Fisher div. with one sample from q(z|x)
-            else:
-                fisher_div = 0.5*(dlnqzz - dlnpzz).pow(2).sum() # Fisher div. with one sample from q(z|x)
+            stability = 0.5* dlnqzy.pow(2).sum() # stability term
+            
+            dlnpz = -z_out # Gaussian Prior on z
+            pyxz = torch.distributions.normal.Normal(y_hat, 1.0) # p(y|x,z)
+            lnpyxz = pyxz.log_prob(y) # log p(x,y|z)
+            dlnpyxz = grad(lnpyxz.sum(), z_out, retain_graph=True)[0] # d/dz log p(x,y|z)
+            fisher_div = 0.5*(dlnqzz - dlnpz - dlnpyxz).pow(2).sum() # Fisher div. with one sample from q(z|x)
 
             if self.flow:
                 fisher_div += KL
